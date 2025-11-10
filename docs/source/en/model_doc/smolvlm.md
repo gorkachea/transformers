@@ -171,6 +171,252 @@ generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=True
 print(generated_texts[0])
 ```
 
+### Error Handling and Best Practices
+
+When working with SmolVLM, it's important to handle common errors gracefully. Here are examples of robust error handling for typical use cases:
+
+#### Handling File Path Errors
+
+```python
+import torch
+from transformers import AutoProcessor, AutoModelForImageTextToText
+from pathlib import Path
+from PIL import Image
+
+processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM2-256M-Video-Instruct")
+model = AutoModelForImageTextToText.from_pretrained(
+    "HuggingFaceTB/SmolVLM2-256M-Video-Instruct",
+    dtype=torch.bfloat16,
+    device_map="auto"
+)
+
+def process_image_safely(image_path: str, prompt: str):
+    """Process an image with proper error handling.
+    
+    Args:
+        image_path: Path to the image file
+        prompt: Text prompt for the model
+        
+    Returns:
+        Generated text description or None if processing fails
+    """
+    # Validate file exists
+    if not Path(image_path).exists():
+        print(f"Error: Image file not found: {image_path}")
+        return None
+    
+    # Validate file extension
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
+    if Path(image_path).suffix.lower() not in valid_extensions:
+        print(f"Error: Unsupported image format. Supported formats: {valid_extensions}")
+        return None
+    
+    # Validate image can be opened
+    try:
+        with Image.open(image_path) as img:
+            img.verify()
+    except Exception as e:
+        print(f"Error: Cannot open image file. It may be corrupted: {e}")
+        return None
+    
+    try:
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "path": image_path},
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+        
+        inputs = processor.apply_chat_template(
+            conversation,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model.device, dtype=torch.bfloat16)
+        
+        output_ids = model.generate(**inputs, max_new_tokens=128)
+        generated_text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+        return generated_text
+        
+    except torch.cuda.OutOfMemoryError:
+        print("Error: Out of GPU memory. Try reducing image resolution or using a smaller model.")
+        return None
+    except Exception as e:
+        print(f"Error during model inference: {e}")
+        return None
+
+# Example usage
+result = process_image_safely("path/to/your/image.jpg", "Describe this image.")
+if result:
+    print(f"Description: {result}")
+```
+
+#### Memory Management for Large Batches
+
+When processing multiple images or videos, memory management becomes critical:
+
+```python
+import torch
+import gc
+
+def process_images_batch(image_paths, prompts, batch_size=1):
+    """Process multiple images with memory-efficient batching.
+    
+    Args:
+        image_paths: List of paths to image files
+        prompts: List of prompts (one per image)
+        batch_size: Number of images to process at once (default: 1)
+        
+    Returns:
+        List of generated descriptions
+    """
+    results = []
+    
+    for i in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[i:i + batch_size]
+        batch_prompts = prompts[i:i + batch_size]
+        
+        # Clear GPU cache before each batch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        try:
+            conversations = []
+            for path, prompt in zip(batch_paths, batch_prompts):
+                if not Path(path).exists():
+                    print(f"Skipping missing file: {path}")
+                    results.append(None)
+                    continue
+                    
+                conversations.append([
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "path": path},
+                            {"type": "text", "text": prompt}
+                        ]
+                    }
+                ])
+            
+            if not conversations:
+                continue
+                
+            inputs = processor.apply_chat_template(
+                conversations,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(model.device, dtype=torch.bfloat16)
+            
+            output_ids = model.generate(**inputs, max_new_tokens=128)
+            generated_texts = processor.batch_decode(output_ids, skip_special_tokens=True)
+            results.extend(generated_texts)
+            
+        except torch.cuda.OutOfMemoryError:
+            print(f"OOM error at batch starting at index {i}. Try reducing batch_size.")
+            # Process images one by one as fallback
+            for path, prompt in zip(batch_paths, batch_prompts):
+                result = process_image_safely(path, prompt)
+                results.append(result)
+        finally:
+            # Clean up
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    
+    return results
+
+# Example: Process multiple images with memory management
+image_paths = ["image1.jpg", "image2.jpg", "image3.jpg"]
+prompts = ["Describe this image"] * len(image_paths)
+descriptions = process_images_batch(image_paths, prompts, batch_size=2)
+```
+
+#### Handling Video Processing Errors
+
+```python
+import cv2
+
+def validate_video(video_path: str):
+    """Validate video file before processing.
+    
+    Args:
+        video_path: Path to video file
+        
+    Returns:
+        tuple: (is_valid, error_message)
+    """
+    if not Path(video_path).exists():
+        return False, f"Video file not found: {video_path}"
+    
+    valid_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+    if Path(video_path).suffix.lower() not in valid_extensions:
+        return False, f"Unsupported video format. Supported: {valid_extensions}"
+    
+    # Try to open video
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return False, "Cannot open video file. It may be corrupted."
+        
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_count == 0:
+            return False, "Video has no frames."
+        
+        cap.release()
+        return True, None
+        
+    except Exception as e:
+        return False, f"Error reading video: {e}"
+
+def process_video_safely(video_path: str, prompt: str):
+    """Process video with error handling."""
+    # Validate video first
+    is_valid, error_msg = validate_video(video_path)
+    if not is_valid:
+        print(f"Error: {error_msg}")
+        return None
+    
+    try:
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "path": video_path},
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+        
+        inputs = processor.apply_chat_template(
+            conversation,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model.device, dtype=torch.bfloat16)
+        
+        generated_ids = model.generate(**inputs, do_sample=False, max_new_tokens=256)
+        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        return generated_text
+        
+    except Exception as e:
+        print(f"Error processing video: {e}")
+        return None
+
+# Example usage
+result = process_video_safely("path/to/video.mp4", "Describe this video in detail")
+if result:
+    print(result)
+```
+
+These error handling patterns help ensure your SmolVLM applications are robust and provide helpful feedback when issues occur.
+
 ## SmolVLMConfig
 
 [[autodoc]] SmolVLMConfig
